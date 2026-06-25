@@ -35,7 +35,7 @@ os.environ['ASTROPY_CACHE_DIR'] = os.path.join(cache_dir, 'astropy_cache')
 os.environ['ASTROPY_USE_DOWNLOAD_CACHE'] = 'True'
 
 try:
-    myappid = 'mycompany.VISTA.engine.v5.4.1'
+    myappid = 'mycompany.VISTA.engine.v5.4.2'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception:
     pass
@@ -58,7 +58,8 @@ REQUIRED_PACKAGES = {
     "astroquery": "astroquery",
     "matplotlib": "matplotlib",
     "astropy": "astropy",
-    "numpy": "numpy"
+    "numpy": "numpy",
+    "scipy": "scipy"
 }
 
 def auto_deploy_environment():
@@ -93,6 +94,7 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import numpy as np
+from scipy.stats import ttest_ind
 
 HAS_ASTROPHYSICS_SUITE = True
 try:
@@ -270,7 +272,9 @@ def import_local_csv_pipeline():
             current_lc_clean = MockLightCurve(t_data, f_data)
 
             total_days = t_data[-1] - t_data[0]
-            periods = np.linspace(0.4, min(60.0, total_days), 25000)
+            max_period_trial = max(5.0, total_days)
+            n_steps = int((max_period_trial - 0.4) / 0.002)
+            periods = np.linspace(0.4, max_period_trial, max(15000, n_steps))
 
             best_p, best_power, best_t0 = 1.0, -1.0, t_data[0]
             for p in periods:
@@ -475,8 +479,11 @@ def _async_pipeline_worker(user_input):
         lc_trend_obj = flatten_res[1]
         
         status_label.configure(text="[STEP 4/5] COMPUTING BLS SIGNAL INTEGRATION...", text_color="#8e44ad")
-        max_period_trial = min(60.0, max(5.0, total_days / 2.0))
-        periods = np.linspace(0.4, max_period_trial, 6000)
+        
+        # Rigorous Pipeline Upgrade: Scan full data volume window dynamically without bounds clamping
+        max_period_trial = max(5.0, total_days)
+        n_steps = int((max_period_trial - 0.4) / 0.001)
+        periods = np.linspace(0.4, max_period_trial, max(30000, n_steps))
         
         try:
             bls = lc_clean.to_periodogram(method='bls', period=periods, objective='snr')
@@ -499,10 +506,8 @@ def _async_pipeline_worker(user_input):
 
         if intel["period"] is not None:
             best_p_val = float(intel["period"])
-            status_mode = "NASA Telemetry Locked"
         else:
             best_p_val = calculated_p
-            status_mode = "BLS Algorithm Computed"
             
         status_label.configure(text="[STEP 5/5] PLOTTING MORPHOLOGY SUB-MODELS...", text_color="#d35400")
         folded = lc_clean.fold(period=best_p_val, epoch_time=t0)
@@ -523,15 +528,48 @@ def _async_pipeline_worker(user_input):
         
         duration_hours = float(duration.value if hasattr(duration, 'value') else duration) * 24.0
 
+        # Rigorous Vetting Module: Perform Automated Two-Sample t-test on Alternating Odd/Even Cycle Depths
+        t_vals = clean_to_flat_array(lc_clean.time) - float(t0.value if hasattr(t0, 'value') else t0)
+        orbits = np.round(t_vals / best_p_val)
+        even = (orbits % 2 == 0)
+        
+        duration_val = float(duration.value if hasattr(duration, 'value') else duration)
+        f_time_clean = clean_to_flat_array(folded.time)
+        f_flux_clean = clean_to_flat_array(folded.flux)
+        box_mask = (f_time_clean >= -duration_val/2) & (f_time_clean <= duration_val/2)
+        
+        try:
+            folded_even = lc_clean[even].fold(period=best_p_val, epoch_time=t0)
+            folded_odd = lc_clean[~even].fold(period=best_p_val, epoch_time=t0)
+            
+            even_time, even_flux = clean_to_flat_array(folded_even.time), clean_to_flat_array(folded_even.flux)
+            odd_time, odd_flux = clean_to_flat_array(folded_odd.time), clean_to_flat_array(folded_odd.flux)
+            
+            even_in_transit = even_flux[(even_time >= -duration_val/2) & (even_time <= duration_val/2)]
+            odd_in_transit = odd_flux[(odd_time >= -duration_val/2) & (odd_time <= duration_val/2)]
+            
+            # Clean out NaNs from vectors
+            even_in_transit = even_in_transit[~np.isnan(even_in_transit)]
+            odd_in_transit = odd_in_transit[~np.isnan(odd_in_transit)]
+            
+            if len(even_in_transit) > 3 and len(odd_in_transit) > 3:
+                t_stat, p_val = ttest_ind(even_in_transit, odd_in_transit, equal_var=False)
+                # If p-value < 0.01, the depth variance between sets is highly significant (Eclipsing Binary signature)
+                vetting_disposition = "EB DETECTED" if p_val < 0.01 else "PASSED"
+            else:
+                vetting_disposition = "INSURGENT DATA"
+        except Exception:
+            vetting_disposition = "VETTING FAULT"
+
         current_metrics_text = (
             f"Orbit Period   : {best_p_val:.4f} Days\n"
             f"Transit Depth  : {final_depth*1000.0:.2f} ppt\n"
             f"Planet Radius  : {final_radius:.2f}x Earth Rad\n"
             f"Transit Duration: {duration_hours:.2f} Hours\n"
             f"Signal SNR Check: {calc_snr:.1f} ({'SECURE' if calc_snr >= 7.1 else 'SUSPECT'})\n"
+            f"Odd/Even Vetting: {vetting_disposition}\n"
             f"Classification : {planet_class}"
         )
-        
 
         if ctk.get_appearance_mode() == "Dark":
             plt.style.use('dark_background')
@@ -569,30 +607,24 @@ def _async_pipeline_worker(user_input):
 
         fig2, (ax4, ax5, ax6) = plt.subplots(3, 1, figsize=(7, 5.8))
         fig2.suptitle(f"Statistical Morphology Models: {user_input.upper()}", fontsize=11, fontweight='bold', color='#27ae60')
-        f_time = clean_to_flat_array(folded.time)
-        f_flux = clean_to_flat_array(folded.flux)
-        ax4.scatter(clean_to_flat_array(folded.phase), f_flux, s=1, color='#bdc3c7', alpha=0.3)
+        ax4.scatter(clean_to_flat_array(folded.phase), f_flux_clean, s=1, color='#bdc3c7', alpha=0.3)
         ax4.set_title("4. Continuous Orbit Full-Phase Folded Alignment Map (Phase -0.5 to 0.5)", fontsize=8, loc='left', fontweight='bold')
         ax4.grid(True, linestyle=':')
 
         b_time = clean_to_flat_array(binned.time)
         b_flux = clean_to_flat_array(binned.flux)
-        ax5.scatter(f_time, f_flux, alpha=0.15, s=1, color='#7f8c8d')
+        ax5.scatter(f_time_clean, f_flux_clean, alpha=0.15, s=1, color='#7f8c8d')
         ax5.plot(b_time, b_flux, color='#2980b9', lw=2.5, label='Binned Telemetry')
-        duration_val = float(duration.value if hasattr(duration, 'value') else duration)
-        box_model = np.ones_like(f_time)
-        box_mask = (f_time >= -duration_val/2) & (f_time <= duration_val/2)
+        
+        box_model = np.ones_like(f_time_clean)
         box_model[box_mask] = 1.0 - calc_depth
-        sort_idx = np.argsort(f_time)
-        ax5.plot(f_time[sort_idx], box_model[sort_idx], color='#e74c3c', lw=1.5, linestyle=':', label='Box Fit')
+        sort_idx = np.argsort(f_time_clean)
+        ax5.plot(f_time_clean[sort_idx], box_model[sort_idx], color='#e74c3c', lw=1.5, linestyle=':', label='Box Fit')
         ax5.set_xlim(-2.5 * duration_val, 2.5 * duration_val)
         ax5.set_title("5. High-Resolution Micro-Scale Transit Profile Geometry Fit", fontsize=8, loc='left', fontweight='bold')
         ax5.legend(fontsize=7, loc='lower left')
         ax5.grid(True, linestyle=':')
 
-        t_vals = clean_to_flat_array(lc_clean.time) - float(t0.value if hasattr(t0, 'value') else t0)
-        orbits = np.round(t_vals / best_p_val)
-        even = (orbits % 2 == 0)
         try:
             ax6.remove()
             ax6_left = plt.subplot(3, 2, 5)
@@ -607,8 +639,8 @@ def _async_pipeline_worker(user_input):
             ax6_left.legend(fontsize=6, loc='lower left')
             ax6_left.grid(True, linestyle=':')
 
-            in_transit_points = f_flux[box_mask & ~np.isnan(f_flux)]
-            out_transit_points = f_flux[~box_mask & ~np.isnan(f_flux)]
+            in_transit_points = f_flux_clean[box_mask & ~np.isnan(f_flux_clean)]
+            out_transit_points = f_flux_clean[~box_mask & ~np.isnan(f_flux_clean)]
             ax6_right.hist(out_transit_points, bins=35, density=True, color='#7f8c8d', alpha=0.5, label='Baseline')
             ax6_right.hist(in_transit_points, bins=35, density=True, color='#2980b9', alpha=0.5, label='In-Transit')
             ax6_right.set_title("6b. Flux Probability Density Distribution", fontsize=7.5, fontweight='bold', loc='left')
@@ -647,7 +679,7 @@ def safely_close_app():
     root.quit()
 
 root = ctk.CTk()
-root.title("VISTA Engine v5.4.1")
+root.title("VISTA Engine v5.4.2")
 root.geometry("1100x750")
 
 if os.path.exists(icon_full_path):
@@ -662,7 +694,7 @@ sidebar = ctk.CTkFrame(root, width=280, corner_radius=0)
 sidebar.pack(side="left", fill="y")
 
 ctk.CTkLabel(sidebar, text="VISTA Vetting Pipe", font=("Segoe UI", 16, "bold"), text_color="#2980b9").pack(pady=(20, 2), padx=20, anchor="w")
-ctk.CTkLabel(sidebar, text="Exo Planet Analyzer v5.4.1", font=("Segoe UI", 10), text_color="#7f8c8d").pack(pady=(0, 15), padx=20, anchor="w")
+ctk.CTkLabel(sidebar, text="Exo Planet Analyzer v5.4.2", font=("Segoe UI", 10), text_color="#7f8c8d").pack(pady=(0, 15), padx=20, anchor="w")
 
 ctk.CTkLabel(sidebar, text="Target Catalog Search Entry:", font=("Segoe UI", 11, "bold")).pack(padx=20, anchor="w")
 star_search_entry = ctk.CTkEntry(sidebar, width=240, height=30, font=("Consolas", 12), placeholder_text="e.g., TRAPPIST-1 c, K2-18 b")
