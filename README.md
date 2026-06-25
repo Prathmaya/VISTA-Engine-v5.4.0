@@ -1,7 +1,7 @@
 # VISTA Engine (Vetting and Interferometric Spacial Transit Analyzer)
 An automated exoplanet transit detection pipeline built in Python. Features adaptive stellar variability filtering, Box Least Squares (BLS) periodogram spectral sweeps and interactive multi-panel morphology models using Kepler and TESS space telescope telemetry
 
-# VISTA Engine v5.4.1
+# VISTA Engine v5.4.2
 
 A lightweight, exoplanet transit analysis engine built in Python. The application streams raw stellar photometry telemetry from NASA's MAST archive to locally process light curves, isolate signals from stellar noise and extract geometric planetary transit profiles.
 
